@@ -1,0 +1,24 @@
+defaults:
+    - tdmpc2
+    - _self_
+
+# environment
+task: ms-peg-insertion-semi
+obs: state
+obs_save: rgbd
+num_envs: 1
+sim_backend: gpu
+
+# evaluation
+checkpoint: /absolute/path/to/checkpoint
+eval_episodes: 10
+# saving
+save_trajectory: false
+success_only: true
+log_path: .
+save_video: true
+
+# misc
+render_obs: false
+compile: false
+add_text: false
