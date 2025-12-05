@@ -13,3 +13,7 @@ $ python demo3/train.py task=mw-assembly-semi steps=500000 obs=rgb demo_path=/pa
 ```
 $ python demo3/train.py task=ms-stack-cube-semi steps=1000000 enable_reward_learning=false demo_sampling_ratio=0.0 policy_pretraining=False
 ```
+
+```
+conda env create -f docker/environment.yaml
+```
