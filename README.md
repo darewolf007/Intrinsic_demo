@@ -7,6 +7,7 @@ $ python demo3/evaluate.py task=ms-humanoid-transport-box-semi checkpoint=/path/
 ```
 $ python demo3/train.py task=ms-stack-cube-semi steps=1000000 demo_path=/path/to/ms-demos/stack-cube-200.pkl enable_reward_learning=true
 $ python demo3/train.py task=mw-assembly-semi steps=500000 obs=rgb demo_path=/path/to/mw-demos/assembly-200.pkl enable_reward_learning=true
+$ python demo3/train.py task=ms-peg-insertion-semi steps=500000 obs=rgb demo_path=/data2/user/sunhaowen/hw_mine/intrinsic_demo3/ms-peg-insertion-semi_trajectories_10.pkl enable_reward_learning=true
 ```
 
 
