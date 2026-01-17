@@ -1,5 +1,11 @@
 import os
+MAX_CPU_CORES = 32  
 
+os.environ["OMP_NUM_THREADS"] = str(MAX_CPU_CORES)
+os.environ["MKL_NUM_THREADS"] = str(MAX_CPU_CORES)
+os.environ["OPENBLAS_NUM_THREADS"] = str(MAX_CPU_CORES)
+os.environ["VECLIB_MAXIMUM_THREADS"] = str(MAX_CPU_CORES)
+os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_CPU_CORES)
 os.environ["MUJOCO_GL"] = "egl"
 os.environ["LAZY_LEGACY_OP"] = "0"
 os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
@@ -29,7 +35,7 @@ torch.backends.cudnn.benchmark = True
 
 torch.set_float32_matmul_precision("high")
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 # os.environ["WANDB_MODE"] = "offline"
 @hydra.main(config_name="demo3", config_path="./config/")
 def train(cfg: dict):

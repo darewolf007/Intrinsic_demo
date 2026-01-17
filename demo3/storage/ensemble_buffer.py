@@ -97,3 +97,20 @@ class EnsembleBuffer(Buffer):
             )
 
         return obs_return
+    
+    def sample_reward_weighted(self, stage_weights: dict):
+        if self._offline_buffer.batch_size <= 0:
+            return super().sample_reward_weighted(stage_weights)
+
+        obs0, action0, reward0, task0 = \
+            self._offline_buffer.sample_reward_weighted(stage_weights)
+
+        obs1, action1, reward1, task1 = \
+            super().sample_reward_weighted(stage_weights)
+
+        return (
+            torch.cat([obs0, obs1], dim=1),
+            torch.cat([action0, action1], dim=1),
+            torch.cat([reward0, reward1], dim=1),
+            torch.cat([task0, task1], dim=0) if task0 and task1 else None,
+        )

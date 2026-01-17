@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import numpy as np
 from common import math
 from common.scale import RunningScale
 from common.world_model import WorldModel
@@ -119,7 +119,7 @@ class Intrinsic_TDMPC2(torch.nn.Module):
                     "params": self.model._encoder.parameters(),
                     "lr": self.cfg.lr * self.cfg.enc_lr_scale,
                 },
-                {"params": self.model._dynamics.parameters()},
+                {"params": self.model._dynamics_ensemble.parameters()},  # [ENSEMBLE] 修改为ensemble
                 {"params": self.model._reward.parameters()},
                 {"params": self.model._Qs.parameters()},
                 {
@@ -156,6 +156,22 @@ class Intrinsic_TDMPC2(torch.nn.Module):
                 device=self.device,
             )
         )
+        
+        # [ENSEMBLE] Bootstrap训练参数
+        self.bootstrap_prob = getattr(cfg, 'bootstrap_prob', 0.8)
+        
+        # [ENSEMBLE] 不确定性惩罚参数
+        self.uncertainty_penalty_max = getattr(cfg, 'uncertainty_penalty_max', 1.0)
+        self.uncertainty_bonus_max = getattr(cfg, 'uncertainty_bonus_max', 0.3)
+        self.disc_loss_threshold_high = getattr(cfg, 'disc_loss_threshold_high', 0.25)
+        self.disc_loss_threshold_low = getattr(cfg, 'disc_loss_threshold_low', 0.05)
+        
+        # [ENSEMBLE] 用于存储当前disc_loss，由trainer传入
+        self._current_disc_loss = 0.3  # 默认值
+        
+        # [ENSEMBLE] 不确定性归一化器
+        self.uncertainty_normalizer = RunningMeanStd(shape=(1,), epsilon=1e-4).to(self.device)
+        
         if cfg.compile:
             print("compiling - tdmpc update")
             self._update = torch.compile(self._update, mode="reduce-overhead")
@@ -228,11 +244,18 @@ class Intrinsic_TDMPC2(torch.nn.Module):
     @torch.no_grad()
     def _estimate_value(self, z, actions, task):
         G, discount = 0, 1
+        total_uncertainty = 0  # [ENSEMBLE] 累积不确定性
+        
         for t in range(self.cfg.horizon):
             reward = math.two_hot_inv(
                 self.model.reward(z, actions[:, t], task), self.cfg
             )
-            z = self.model.next(z, actions[:, t], task)
+            
+            # [ENSEMBLE] 使用带不确定性的预测
+            z_next, uncertainty, _ = self.model.next_with_uncertainty(z, actions[:, t], task)
+            total_uncertainty = total_uncertainty + discount * uncertainty.unsqueeze(-1)
+            z = z_next
+            
             G = G + discount * reward
             discount_update = (
                 self.discount[torch.tensor(task)]
@@ -240,9 +263,23 @@ class Intrinsic_TDMPC2(torch.nn.Module):
                 else self.discount
             )
             discount = discount * discount_update
-        return G + discount * self.model.Q(
+        
+        terminal_value = self.model.Q(
             z, self.model.pi(z, task)[1], task, return_type="avg"
         )
+        
+        # [ENSEMBLE] 应用不确定性调整
+        uncertainty_coef = self._get_uncertainty_coef()
+        # 归一化不确定性
+        if total_uncertainty.numel() > 0:
+            self.uncertainty_normalizer.update(total_uncertainty.reshape(-1, 1))
+        norm_uncertainty = self.uncertainty_normalizer(total_uncertainty)
+        
+        # uncertainty_coef > 0: bonus (探索)
+        # uncertainty_coef < 0: penalty (保守)
+        uncertainty_adjustment = uncertainty_coef * norm_uncertainty
+        
+        return G + discount * terminal_value + uncertainty_adjustment
 
     @torch.no_grad()
     def _plan(self, obs, t0=False, eval_mode=False, task=None):
@@ -374,12 +411,56 @@ class Intrinsic_TDMPC2(torch.nn.Module):
             next_z, pi, task, return_type="min", target=True
         )
 
+    def set_rnd_scale(self, scale: float):
+        self._rnd_scale_plan = float(scale)
+
+    def set_disc_loss(self, disc_loss: float):
+        """[ENSEMBLE] 由trainer调用，传入当前的discriminator loss"""
+        self._current_disc_loss = float(disc_loss)
+
+    def _get_uncertainty_coef(self):
+        """
+        [ENSEMBLE] 根据disc_loss自适应计算不确定性系数
+        - disc_loss高 (早期): 返回正值 (bonus，鼓励探索)
+        - disc_loss低 (后期): 返回负值 (penalty，保守优化)
+        """
+        disc_loss = self._current_disc_loss
+        
+        if disc_loss > self.disc_loss_threshold_high:
+            # 早期：探索bonus
+            return self.uncertainty_bonus_max
+        elif disc_loss < self.disc_loss_threshold_low:
+            # 后期：保守penalty
+            return -self.uncertainty_penalty_max
+        else:
+            # 过渡期：线性插值
+            progress = (self.disc_loss_threshold_high - disc_loss) / \
+                       (self.disc_loss_threshold_high - self.disc_loss_threshold_low)
+            return self.uncertainty_bonus_max - \
+                   (self.uncertainty_bonus_max + self.uncertainty_penalty_max) * progress
+
+    @torch.no_grad()
+    def act_policy(self, obs, eval_mode=False, task=None):
+        """
+        Policy-dominant sampling action:
+        Always use self.model.pi (NOT MPC), even if cfg.mpc=True.
+        """
+        obs = obs.to(self.device, non_blocking=True)
+        if task is not None:
+            task = torch.tensor([task], device=self.device)
+        z = self.model.encode(obs, task)
+        # pi(...) returns (mu, pi, log_pi, log_std)
+        mu, pi, _, _ = self.model.pi(z, task)
+        a = mu if eval_mode else pi
+        return a.cpu()
+
     # [MODIFIED] Update loop 接收 rnd_scale 并解耦奖励
     def _update(
-        self, obs, action, reward, task=None, modify_reward=None, action_penalty=False, rnd_scale=0.0
+        self, obs, action, reward, task=None, modify_reward=None, action_penalty=False, rnd_scale=0.0, update_dynamics=True, update_policy=True
     ):
         # Compute targets
         with torch.no_grad():
+            ori_reward = reward.clone()
             next_z = self.model.encode(obs[1:], task)
             
             # [Step 1] 应用 Discriminator 奖励 (Demo3 逻辑)
@@ -402,6 +483,11 @@ class Intrinsic_TDMPC2(torch.nn.Module):
             
             if rnd_scale > 0:
                 # [MODIFIED] 准备 RND 输入
+                stage1_threshold = 1.0
+                gate_mask = (ori_reward >= stage1_threshold)  # bool
+                gate_mask = gate_mask.cummax(dim=0).values   # bool：达到一次后持续开启
+                gate_mask = gate_mask.float()
+
                 if self.use_raw_obs_for_rnd:
                     # 使用原始 Raw State (从 obs 字典中提取并拼接)
                     next_obs_dict = obs[1:] # T+1 的观测
@@ -427,14 +513,15 @@ class Intrinsic_TDMPC2(torch.nn.Module):
                 
                 # 记录原始均值用于 Logging
                 raw_intr_mean = raw_intr_reward.mean().item()
-
+                masked_raw = raw_intr_reward[gate_mask.bool()]
                 # [FIXED] 展平后更新 Normalizer，解决维度报错
-                self.rnd_r_norm.update(raw_intr_reward.reshape(-1, 1))
+                if masked_raw.numel() > 0:
+                    self.rnd_r_norm.update(masked_raw.reshape(-1, 1))
                 
                 # [MODIFIED] 归一化后 Clamp 到非负
-                # 解决“负奖励”导致 Stage 3 无法突破的问题
+                # 解决"负奖励"导致 Stage 3 无法突破的问题
                 norm_intr_reward_tensor = self.rnd_r_norm(raw_intr_reward).clamp(min=0.0)
-                
+                norm_intr_reward_tensor = norm_intr_reward_tensor * gate_mask
                 # [CRITICAL] 仅将 RND 加到 Critic 的目标上
                 total_reward_for_critic = reward + rnd_scale * norm_intr_reward_tensor.detach()
             else:
@@ -459,19 +546,33 @@ class Intrinsic_TDMPC2(torch.nn.Module):
         )
         z = self.model.encode(obs[0], task)
         zs[0] = z
-        consistency_loss = 0
-        rnd_loss = 0
+        consistency_loss = 0.0
+        rnd_loss = 0.0
         
         for t, (_action, _next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):
+            # [ENSEMBLE] Bootstrap训练：每个ensemble成员在随机子集上训练
+            if update_dynamics:
+                batch_size = _action.shape[0]
+                for ens_idx in range(self.model.num_ensemble):
+                    # 生成bootstrap mask
+                    mask = torch.rand(batch_size, device=self.device) < self.bootstrap_prob
+                    if mask.sum() < 4:  # 确保至少有一些样本
+                        mask[:4] = True
+                    
+                    # 只用选中的样本计算这个ensemble的loss
+                    z_pred_ens = self.model.next(z[mask], _action[mask], task, ensemble_idx=ens_idx)
+                    ens_loss = F.mse_loss(z_pred_ens, _next_z[mask])
+                    consistency_loss = consistency_loss + ens_loss * self.cfg.rho**t / self.model.num_ensemble
+            
+            # 使用ensemble均值作为下一步的z
             z = self.model.next(z, _action, task)
-            consistency_loss = (
-                consistency_loss + F.mse_loss(z, _next_z) * self.cfg.rho**t
-            )
             zs[t + 1] = z
             
             # [MODIFIED] 计算 RND Loss
-            if rnd_scale > 0:
+            if rnd_scale > 0 and update_dynamics:
                 # 准备当前时间步的 RND 输入
+                stage1_threshold = 1.0
+                gate_t = gate_mask[t]
                 if self.use_raw_obs_for_rnd:
                     curr_obs_dict = obs[t+1] # 这里的 obs 已经是 batch 切片过的吗？注意 unbind
                     # Wait, obs[1:] was unbound above? No. 
@@ -492,96 +593,132 @@ class Intrinsic_TDMPC2(torch.nn.Module):
 
                 curr_pred, curr_target = self.rnd(curr_rnd_input) 
                 # 拟合固定 target
-                rnd_loss = rnd_loss + F.mse_loss(curr_pred, curr_target.detach())
-
+                per_loss = (curr_pred - curr_target.detach()).pow(2).mean(dim=-1, keepdim=True)  # [B,1]
+                rnd_loss = rnd_loss + (per_loss * gate_t).mean()
         # Predictions
         _zs = zs[:-1]
+        
+        # 只有更新 Policy 时才需要算 Q，只有更新 Dynamics 时才需要算 Reward Predictor
+        # 但 TD-MPC 是一起算的，为了代码简单，我们算出来，但在 Loss 加和时控制
         qs = self.model.Q(_zs, action, task, return_type="all")
         reward_preds = self.model.reward(_zs, action, task)
 
         # Compute losses
-        reward_loss, value_loss = 0, 0
-        for t, (rew_pred_unbind, rew_model_unbind, td_targets_unbind, qs_unbind) in enumerate(
-            zip(
-                reward_preds.unbind(0),
-                reward_for_model.unbind(0), # [KEY] 模型预测的是 (Extrinsic + Disc)
-                td_targets.unbind(0),       # [KEY] Critic 拟合的是 (Extrinsic + Disc + RND)
-                qs.unbind(1),
-            )
-        ):
-            reward_loss = (
-                reward_loss
-                + math.soft_ce(rew_pred_unbind, rew_model_unbind, self.cfg).mean()
-                * self.cfg.rho**t
-            )
-            for _, qs_unbind_unbind in enumerate(qs_unbind.unbind(0)):
-                value_loss = (
-                    value_loss
-                    + math.soft_ce(qs_unbind_unbind, td_targets_unbind, self.cfg).mean()
-                    * self.cfg.rho**t
+        reward_loss, value_loss = 0.0, 0.0
+        
+        # 只有在需要相关 Loss 时才进行循环计算，节省计算图
+        if update_dynamics or update_policy:
+            for t, (rew_pred_unbind, rew_model_unbind, qs_unbind) in enumerate(
+                zip(
+                    reward_preds.unbind(0),
+                    reward_for_model.unbind(0),
+                    qs.unbind(1),
                 )
+            ):
+                # 1. Reward Prediction Loss (属于 World Model)
+                if update_dynamics:
+                    reward_loss = (
+                        reward_loss
+                        + math.soft_ce(rew_pred_unbind, rew_model_unbind, self.cfg).mean()
+                        * self.cfg.rho**t
+                    )
+                
+                # 2. Value Loss (属于 Critic/Policy)
+                if update_policy:
+                    td_targets_unbind = td_targets[t] # 注意：td_targets 需要对应索引
+                    for _, qs_unbind_unbind in enumerate(qs_unbind.unbind(0)):
+                        value_loss = (
+                            value_loss
+                            + math.soft_ce(qs_unbind_unbind, td_targets_unbind, self.cfg).mean()
+                            * self.cfg.rho**t
+                        )
 
+        # Normalize Losses
         consistency_loss = consistency_loss / self.cfg.horizon
         reward_loss = reward_loss / self.cfg.horizon
         value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
-        
-        # [MODIFIED] RND Loss averaging
         if isinstance(rnd_loss, torch.Tensor):
             rnd_loss = rnd_loss / self.cfg.horizon
+
+        # [CRITICAL] 组合 Total Loss
+        total_loss = 0.0
         
-        total_loss = (
-            self.cfg.consistency_coef * consistency_loss
-            + self.cfg.reward_coef * reward_loss
-            + self.cfg.value_coef * value_loss
-        )
+        # 仅当 update_dynamics 为真，才优化 consistency 和 reward prediction
+        if update_dynamics:
+            total_loss += self.cfg.consistency_coef * consistency_loss
+            total_loss += self.cfg.reward_coef * reward_loss
+            
+        # 仅当 update_policy 为真，才优化 value loss
+        # 注意：Value Loss 通常也会回传梯度给 Encoder (Representation Learning)。
+        # 如果你希望 Policy 更新完全不影响 World Model (包括 Encoder)，你需要在这里 detach _zs
+        # 但通常我们希望 Value 信号也能优化 Encoder，只是不要优化 Dynamics (Next state prediction)。
+        # 由于我们这里没有加 consistency loss，Dynamics 网络本身不会被 Value Loss 更新，
+        # 只有 Encoder 会被 Value Loss 共同更新，这通常是可以接受甚至有益的。
+        if update_policy:
+            total_loss += self.cfg.value_coef * value_loss
 
         # Update model
+        self.optim.zero_grad(set_to_none=True)
         total_loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(), self.cfg.grad_clip_norm
         )
         self.optim.step()
-        self.optim.zero_grad(set_to_none=True)
         
         # [NEW] Update RND Predictor separately
-        if rnd_scale > 0:
+        if rnd_scale > 0 and update_dynamics:
             self.rnd_optim.zero_grad()
             rnd_loss.backward()
             self.rnd_optim.step()
-
-        # Update policy
-        pi_loss, pi_grad_norm = self.update_pi(zs.detach(), task)
-
-        # Update target Q-functions
-        self.model.soft_update_target_Q()
+        pi_loss, pi_grad_norm = 0.0, 0.0
+        if update_policy:
+            # 只有在 Policy 阶段才更新 Actor
+            pi_loss, pi_grad_norm = self.update_pi(zs.detach(), task)
+            # Update target Q-functions
+            self.model.soft_update_target_Q()
 
         # Return training statistics
         self.model.eval()
         
         # [NEW] Enhanced Logging Dictionary
+        # logs = {
+        #     "consistency_loss": consistency_loss,
+        #     "reward_loss": reward_loss,
+        #     "value_loss": value_loss,
+        #     "pi_loss": pi_loss,
+        #     "total_loss": total_loss,
+        #     "grad_norm": grad_norm,
+        #     "pi_grad_norm": pi_grad_norm,
+        #     "pi_scale": self.scale.value,
+        # }
         logs = {
-            "consistency_loss": consistency_loss,
-            "reward_loss": reward_loss,
-            "value_loss": value_loss,
-            "pi_loss": pi_loss,
             "total_loss": total_loss,
-            "grad_norm": grad_norm,
-            "pi_grad_norm": pi_grad_norm,
-            "pi_scale": self.scale.value,
-        }
-        
-        if rnd_scale > 0:
-            logs.update({
-                "rnd_loss": rnd_loss,
-                "intr_reward_raw_mean": raw_intr_mean, # 原始 RND 误差均值
-                "intr_reward_weighted_mean": (rnd_scale * norm_intr_reward_tensor).mean(), # 实际加到 Q 值里的奖励均值
-            })
+        }        
+        # if rnd_scale > 0:
+        #     logs.update({
+        #         "rnd_loss": rnd_loss,
+        #         "intr_reward_raw_mean": raw_intr_mean, # 原始 RND 误差均值
+        #         "intr_reward_weighted_mean": (rnd_scale * norm_intr_reward_tensor).mean(), # 实际加到 Q 值里的奖励均值
+        #     })
             
         return TensorDict(logs).detach().mean()
 
     def update(self, buffer, **kwargs):
+        reward_weights = {
+            0.0: 1.0,   # 初始阶段
+            1.0: 1.0,
+            2.0: 4.0,
+            3.0: 8.0,   # 成功阶段
+        }
         obs, action, reward, task = buffer.sample()
         if task is not None:
             kwargs["task"] = task
         torch.compiler.cudagraph_mark_step_begin()
-        return self._update(obs, action, reward, **kwargs)
+        self._update(obs, action, reward, update_dynamics=True, update_policy=False, **kwargs)
+
+        obs, action, reward, task = buffer.sample_reward_weighted(reward_weights)
+        if task is not None:
+            kwargs["task"] = task
+        # self._update(obs, action, reward)
+        torch.compiler.cudagraph_mark_step_begin()
+        return self._update(obs, action, reward, update_dynamics=False, update_policy=True, **kwargs)

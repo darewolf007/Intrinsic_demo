@@ -220,11 +220,11 @@ class Demo3Trainer(Trainer):
         # Start interactive training
         print(colored("\nReplay buffer seeding", "yellow", attrs=["bold"]))
         train_metrics, done, eval_next = {}, torch.tensor(True), False
-        
+
         # [NEW] 输出探索调度信息
         start_step = getattr(self.cfg, 'rnd_start_step', self.cfg.steps // 3)
         max_scale = getattr(self.cfg, 'intrinsic_scale', 0.5)
-        
+
         while self._step <= self.cfg.steps:
 
             # Evaluate agent periodically
@@ -239,9 +239,7 @@ class Demo3Trainer(Trainer):
 
             # Reset environment
             if done.any():
-                assert (
-                    done.all()
-                ), "Vectorized environments must reset all environments at once."
+                assert done.all(), "Vectorized environments must reset all environments at once."
                 if eval_next:
                     eval_metrics = self.eval()
                     eval_metrics.update(self.common_metrics())
@@ -270,55 +268,83 @@ class Demo3Trainer(Trainer):
             self._alpha = (
                 max(0, self.cfg.max_bc_steps - self._step) / self.cfg.max_bc_steps
             )
+
+            # -----------------------------
+            # [MODIFIED] 关键：在采样动作前，把 rnd_scale 写入 agent（影响 MPC 规划）
+            # -----------------------------
+            if self._step >= self.cfg.seed_steps:
+                current_rnd_scale = self.get_rnd_scale()
+            else:
+                current_rnd_scale = 0.0
+            self.agent.set_rnd_scale(current_rnd_scale)
+            # -----------------------------
+
             # Collect experience
             if self._step > self.cfg.seed_steps:
-                if np.random.random() < self._alpha and self.cfg.get(
-                    "policy_pretraining", False
-                ):
+                if np.random.random() < self._alpha and self.cfg.get("policy_pretraining", False):
+                    # 仍保留 BC 混合（原样）
                     action = self.agent.policy_action(obs, eval_mode=True)
                 else:
-                    action = self.agent.act(obs, t0=len(self._tds) == 1)
+                    # ==========================
+                    # [MODIFIED] 训练阶段 MPC:Policy = 1:1 交替
+                    # ==========================
+                    # 用全局 step 计算交替位（每次循环 step 增加 num_envs）
+                    k = (self._step // self.cfg.num_envs)
+                    use_mpc = (k % 2 == 0)
+
+                    if use_mpc:
+                        action = self.agent.act(obs, t0=len(self._tds) == 1)          # MPC
+                    else:
+                        action = self.agent.act_policy(obs, eval_mode=False)          # Policy
+                    # ==========================
+
             elif self.cfg.get("policy_pretraining", False):
                 action = self.agent.policy_action(obs, eval_mode=True)
             else:
                 action = self.env.rand_act()
+
             obs, reward, done, info = self.env.step(action)
             self._tds.append(self.to_td(obs, action, reward, device="cpu"))
 
             # Update discriminator and agent
+            # self.cfg.seed_steps = 2000
             if self._step >= self.cfg.seed_steps:
                 if self._step == self.cfg.seed_steps:
-                    num_updates = max(
-                        1, int(self.cfg.seed_steps / self.cfg.steps_per_update)
-                    )
+                    num_updates = max(1, int(self.cfg.seed_steps / self.cfg.steps_per_update))
                     print(colored("\nTraining DEMO3 Agent", "green", attrs=["bold"]))
-                    print(
-                        f"Pretraining agent with {num_updates} update steps on seed data..."
-                    )
+                    print(f"Pretraining agent with {num_updates} update steps on seed data...")
                 else:
-                    num_updates = max(
-                        1, int(self.cfg.num_envs / self.cfg.steps_per_update)
-                    )
-                
-                # [NEW] 获取当前步骤的 RND 权重
-                current_rnd_scale = self.get_rnd_scale()
-                
+                    num_updates = max(1, int(self.cfg.num_envs / self.cfg.steps_per_update))
+
+                # [MODIFIED] 复用上面采样时的 current_rnd_scale（保持一致）
+                # ============================================================
+                # 修改 train 方法中的更新循环
+                # 找到 for _ in range(num_updates): 部分并修改
+                # ============================================================
+
                 for _ in range(num_updates):
                     disc_train_metrics = self.disc.update(
                         self.buffer,
                         encoder_function=partial(self.agent.model.encode, task=None),
                     )
-                    # [MODIFIED] 将 scale 传入 update
+                    
+                    # [ENSEMBLE] 获取当前disc_loss并传递给agent
+                    current_disc_loss = disc_train_metrics.get("discriminator_loss", 0.3)
+                    if isinstance(current_disc_loss, torch.Tensor):
+                        current_disc_loss = current_disc_loss.item()
+                    self.agent.set_disc_loss(current_disc_loss)
+                    
                     agent_train_metrics = self.agent.update(
                         self.buffer,
                         modify_reward=self.disc.get_reward,
                         action_penalty=self.cfg.action_penalty,
-                        rnd_scale=current_rnd_scale # 传入动态权重
+                        rnd_scale=current_rnd_scale,
                     )
                 train_metrics.update(disc_train_metrics)
                 train_metrics.update(agent_train_metrics)
-                # [NEW] Log current RND schedule value
                 train_metrics.update({"rnd_schedule_value": current_rnd_scale})
+                # [ENSEMBLE] 记录不确定性系数
+                train_metrics.update({"uncertainty_coef": self.agent._get_uncertainty_coef()})
 
             self._step += self.cfg.num_envs
 

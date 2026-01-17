@@ -130,3 +130,56 @@ class Buffer:
         """Sample a single batch with no slicing"""
         td = self._buffer.sample(self._batch_size)
         return td.to(self._device) if return_td else self._prepare_batch(td)
+        
+    def sample_reward_weighted(
+        self,
+        reward_weights: dict,
+        mode: str = "max",   # "max" | "last" | "sum"
+    ):
+        # 1) 正常 sample 一个 batch 序列: [T+1, B]
+        td = (
+            self._buffer.sample()
+            .reshape(-1, self.cfg.horizon + 1)
+            .permute(1, 0)
+        )
+
+        if "reward" not in td.keys():
+            return self._prepare_batch(td)
+
+        # reward: [T+1, B] 或 [T, B]
+        reward = td["reward"]
+
+        # 对齐时间（通常 reward[1:] 对应 transition）
+        reward = reward[1:] if reward.shape[0] == self.cfg.horizon + 1 else reward
+        T, B = reward.shape
+
+        # 2) 序列级 reward
+        if mode == "max":
+            seq_reward = reward.max(dim=0).values      # [B]
+        elif mode == "last":
+            seq_reward = reward[-1]                    # [B]
+        elif mode == "sum":
+            seq_reward = reward.sum(dim=0)             # [B]
+        else:
+            raise ValueError(f"Unknown mode={mode}")
+
+        # 3) 根据 reward → 权重
+        w = torch.zeros(B, device=seq_reward.device, dtype=torch.float)
+        for r_value, weight in reward_weights.items():
+            w[seq_reward == float(r_value)] = float(weight)
+
+        ws = w.sum()
+        if ws <= 0:
+            td_fallback = (
+                self._buffer.sample()
+                .reshape(-1, self.cfg.horizon + 1)
+                .permute(1, 0)
+            )
+            return self._prepare_batch(td_fallback)
+
+        w = w / ws
+
+        idx = torch.multinomial(w, num_samples=B, replacement=True)
+        new_td = td[:, idx]
+
+        return self._prepare_batch(new_td)

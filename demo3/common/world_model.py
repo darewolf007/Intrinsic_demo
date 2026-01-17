@@ -26,12 +26,20 @@ class WorldModel(nn.Module):
             for i in range(len(cfg.tasks)):
                 self._action_masks[i, : cfg.action_dims[i]] = 1.0
         self._encoder = layers.enc(cfg)
-        self._dynamics = layers.mlp(
-            cfg.latent_dim + cfg.action_dim + cfg.task_dim,
-            2 * [cfg.mlp_dim],
-            cfg.latent_dim,
-            act=layers.SimNorm(cfg),
-        )
+        # [ENSEMBLE] 创建5个独立的dynamics网络
+        self.num_ensemble = getattr(cfg, 'num_ensemble', 5)
+        self._dynamics_ensemble = nn.ModuleList([
+            layers.mlp(
+                cfg.latent_dim + cfg.action_dim + cfg.task_dim,
+                2 * [cfg.mlp_dim],
+                cfg.latent_dim,
+                act=layers.SimNorm(cfg),
+            )
+            for _ in range(self.num_ensemble)
+        ])
+        # 为每个ensemble成员使用不同的初始化
+        for i, dyn in enumerate(self._dynamics_ensemble):
+            self._init_ensemble_member(dyn, seed=i * 1000)
         self._reward = layers.mlp(
             cfg.latent_dim + cfg.action_dim + cfg.task_dim,
             2 * [cfg.mlp_dim],
@@ -60,6 +68,15 @@ class WorldModel(nn.Module):
         )
         self.init()
 
+    def _init_ensemble_member(self, module, seed):
+        """为ensemble成员使用不同seed初始化，确保多样性"""
+        torch.manual_seed(seed)
+        for m in module.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
     def init(self):
         # Create params
         self._detach_Qs_params = TensorDictParams(self._Qs.params.data, no_convert=True)
@@ -78,9 +95,9 @@ class WorldModel(nn.Module):
 
     def __repr__(self):
         repr = "TD-MPC2 World Model\n"
-        modules = ["Encoder", "Dynamics", "Reward", "Policy prior", "Q-functions"]
+        modules = ["Encoder", "Dynamics (Ensemble)", "Reward", "Policy prior", "Q-functions"]
         for i, m in enumerate(
-            [self._encoder, self._dynamics, self._reward, self._pi, self._Qs]
+            [self._encoder, self._dynamics_ensemble, self._reward, self._pi, self._Qs]
         ):
             repr += f"{modules[i]}: {m}\n"
         repr += "Learnable parameters: {:,}".format(self.total_params)
@@ -143,14 +160,54 @@ class WorldModel(nn.Module):
             return torch.stack([out[k] for k in out.keys()]).mean(0)
         return self._encoder[self.cfg.obs](obs)
 
-    def next(self, z, a, task):
+    def next(self, z, a, task, ensemble_idx=None):
         """
         Predicts the next latent state given the current latent state and action.
+        ensemble_idx: 如果指定，只使用该索引的网络；否则使用均值
         """
         if self.cfg.multitask:
             z = self.task_emb(z, task)
-        z = torch.cat([z, a], dim=-1)
-        return self._dynamics(z)
+        z_a = torch.cat([z, a], dim=-1)
+        
+        if ensemble_idx is not None:
+            # 使用指定的ensemble成员
+            return self._dynamics_ensemble[ensemble_idx](z_a)
+        else:
+            # 使用所有ensemble的均值
+            predictions = torch.stack([dyn(z_a) for dyn in self._dynamics_ensemble], dim=0)
+            return predictions.mean(dim=0)
+
+    def next_with_uncertainty(self, z, a, task):
+        """
+        预测下一状态并返回不确定性估计
+        
+        Returns:
+            mean: 预测均值 [batch_size, latent_dim]
+            uncertainty: 不确定性 (pairwise disagreement) [batch_size]
+            all_predictions: 所有预测 [num_ensemble, batch_size, latent_dim]
+        """
+        if self.cfg.multitask:
+            z = self.task_emb(z, task)
+        z_a = torch.cat([z, a], dim=-1)
+        
+        # 获取所有ensemble的预测
+        all_predictions = torch.stack([dyn(z_a) for dyn in self._dynamics_ensemble], dim=0)
+        # shape: [num_ensemble, batch_size, latent_dim]
+        
+        mean = all_predictions.mean(dim=0)
+        
+        # 计算pairwise disagreement作为不确定性
+        num_ensemble = all_predictions.shape[0]
+        pairwise_diffs = []
+        for i in range(num_ensemble):
+            for j in range(i + 1, num_ensemble):
+                diff = (all_predictions[i] - all_predictions[j]).pow(2).mean(dim=-1)
+                pairwise_diffs.append(diff)
+        
+        uncertainty = torch.stack(pairwise_diffs, dim=0).mean(dim=0).sqrt()
+        # shape: [batch_size]
+        
+        return mean, uncertainty, all_predictions
 
     def reward(self, z, a, task):
         """
