@@ -414,6 +414,7 @@ class Intrinsic_TDMPC2(torch.nn.Module):
     def set_rnd_scale(self, scale: float):
         self._rnd_scale_plan = float(scale)
 
+<<<<<<< HEAD
     def set_disc_loss(self, disc_loss: float):
         """[ENSEMBLE] 由trainer调用，传入当前的discriminator loss"""
         self._current_disc_loss = float(disc_loss)
@@ -439,6 +440,8 @@ class Intrinsic_TDMPC2(torch.nn.Module):
             return self.uncertainty_bonus_max - \
                    (self.uncertainty_bonus_max + self.uncertainty_penalty_max) * progress
 
+=======
+>>>>>>> 2e5d980918e17bccceccde5b04b0c253c54ba7b7
     @torch.no_grad()
     def act_policy(self, obs, eval_mode=False, task=None):
         """
@@ -566,6 +569,13 @@ class Intrinsic_TDMPC2(torch.nn.Module):
             
             # 使用ensemble均值作为下一步的z
             z = self.model.next(z, _action, task)
+<<<<<<< HEAD
+=======
+            if update_dynamics:
+                consistency_loss = (
+                    consistency_loss + F.mse_loss(z, _next_z) * self.cfg.rho**t
+                )
+>>>>>>> 2e5d980918e17bccceccde5b04b0c253c54ba7b7
             zs[t + 1] = z
             
             # [MODIFIED] 计算 RND Loss

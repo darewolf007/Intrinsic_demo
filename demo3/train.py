@@ -35,8 +35,13 @@ torch.backends.cudnn.benchmark = True
 
 torch.set_float32_matmul_precision("high")
 
+<<<<<<< HEAD
 os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 # os.environ["WANDB_MODE"] = "offline"
+=======
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["WANDB_MODE"] = "offline"
+>>>>>>> 2e5d980918e17bccceccde5b04b0c253c54ba7b7
 @hydra.main(config_name="demo3", config_path="./config/")
 def train(cfg: dict):
     """
