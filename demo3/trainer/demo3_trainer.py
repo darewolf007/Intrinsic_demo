@@ -317,20 +317,16 @@ class Demo3Trainer(Trainer):
                     num_updates = max(1, int(self.cfg.num_envs / self.cfg.steps_per_update))
 
                 # [MODIFIED] 复用上面采样时的 current_rnd_scale（保持一致）
-<<<<<<< HEAD
                 # ============================================================
                 # 修改 train 方法中的更新循环
                 # 找到 for _ in range(num_updates): 部分并修改
                 # ============================================================
 
-=======
->>>>>>> 2e5d980918e17bccceccde5b04b0c253c54ba7b7
                 for _ in range(num_updates):
                     disc_train_metrics = self.disc.update(
                         self.buffer,
                         encoder_function=partial(self.agent.model.encode, task=None),
                     )
-<<<<<<< HEAD
                     
                     # [ENSEMBLE] 获取当前disc_loss并传递给agent
                     current_disc_loss = disc_train_metrics.get("discriminator_loss", 0.3)
@@ -338,8 +334,6 @@ class Demo3Trainer(Trainer):
                         current_disc_loss = current_disc_loss.item()
                     self.agent.set_disc_loss(current_disc_loss)
                     
-=======
->>>>>>> 2e5d980918e17bccceccde5b04b0c253c54ba7b7
                     agent_train_metrics = self.agent.update(
                         self.buffer,
                         modify_reward=self.disc.get_reward,
